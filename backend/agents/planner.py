@@ -102,7 +102,9 @@ def run_planner(state: CampaignState, db: Session) -> CampaignState:
             f"Current IST time: {now_str}\n\n"
             f"Segment taxonomy from Profiler:\n{json.dumps(segment_taxonomy, indent=2)}\n\n"
             f"Total customers: {len(profiles_summary)}\n"
-            f"Sample profiles (first 100):\n{json.dumps(profiles_summary[:100], indent=2)}\n\n"
+            f"Sample profiles (first 5):\n{json.dumps(profiles_summary[:5], indent=2)}\n\n"
+            f"Note: You MUST return ONLY a raw JSON dictionary without any markdown wrappers or surrounding text. DO NOT rewrite the profiles. Return EXACTLY this structure:\n"
+            f'{{"strategy_rationale": "...", "segments": [{{...}}]}}'
             f"Return ONLY valid JSON."
         )),
     ]
@@ -213,4 +215,5 @@ def _get_llm():
         model=os.environ.get("OLLAMA_MODEL", "glm4:latest"),
         base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
         temperature=0.3,
+        num_predict=4096,
     )

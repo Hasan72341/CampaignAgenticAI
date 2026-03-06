@@ -77,13 +77,16 @@ def run_generator(state: CampaignState, db: Session) -> CampaignState:
     now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30)))
     now_str = now_ist.strftime("%d:%m:%y %H:%M:%S")
 
+    # Strip customer_ids to avoid massive context for LLM
+    clean_segments = [{k: v for k, v in s.items() if k != "customer_ids"} for s in segments]
+
     llm = _get_llm()
     messages = [
         SystemMessage(content=GENERATOR_SYSTEM_PROMPT),
         HumanMessage(content=(
             f"Campaign Brief: {brief}{strategy_addendum}\n\n"
             f"Current IST time: {now_str}\n\n"
-            f"Segments to generate content for:\n{json.dumps(segments, indent=2)}\n\n"
+            f"Segments to generate content for:\n{json.dumps(clean_segments, indent=2)}\n\n"
             f"For each segment, generate one variant. Return ONLY valid JSON."
         )),
     ]
@@ -236,4 +239,5 @@ def _get_llm():
         model=os.environ.get("OLLAMA_MODEL", "glm4:latest"),
         base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
         temperature=0.7,  # higher for creative copy
+        num_predict=4096,
     )

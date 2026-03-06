@@ -79,8 +79,8 @@ def run_profiler(state: CampaignState, db: Session) -> CampaignState:
     logger.info("[Profiler] Fetched %d customer records (total_count=%d)", len(customers), total_count)
 
     # ── 2. Ask LLM to discover fields and assign segment tags ─────────────────
-    # Sample first 200 records for the LLM (avoid huge context)
-    sample = customers[:200]
+    # Sample first 10 records for the LLM (avoid huge context and timeouts)
+    sample = customers[:10]
     llm = _get_llm()
 
     messages = [
@@ -234,4 +234,5 @@ def _get_llm():
         model=os.environ.get("OLLAMA_MODEL", "glm4:latest"),
         base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
         temperature=0.2,
+        num_predict=4096,
     )

@@ -18,76 +18,7 @@ from sqlalchemy.orm import Session
 from db.database import get_db
 from db.models import Campaign, CampaignStatus, Segment, Variant, AgentLog
 from tools.campaign_api_tools import get_campaign_tools
-from workflows.langgraph_flow import run_campaign_workflow
-
-logger = logging.getLogger(__name__)
-router = APIRouter()
-
-
-# ── Request / Response schemas ────────────────────────────────────────────────
-
-class GenerateCampaignRequest(BaseModel):
-    brief: str
-
-
-class GenerateCampaignResponse(BaseModel):
-    campaign_id: str
-    status: str
-
-
-# ── Helper ────────────────────────────────────────────────────────────────────
-
-def _serialize_campaign(campaign: Campaign) -> dict:
-    segments_data = []
-    for seg in campaign.segments:
-        variants_data = [
-            {
-                "id": v.id,
-                "subject": v.subject,
-                "body": v.body,
-                "has_emoji": v.has_emoji,
-                "has_url": v.has_url,
-                "external_campaign_id": v.external_campaign_id,
-                "sent_count": v.sent_count,
-                "open_count": v.open_count,
-                "click_count": v.click_count,
-                "open_rate": round(v.open_count / v.sent_count * 100, 2) if v.sent_count else None,
-                "click_rate": round(v.click_count / v.sent_count * 100, 2) if v.sent_count else None,
-            }
-            for v in seg.variants
-        ]
-        segments_data.append({
-            "id": seg.id,
-            "label": seg.label,
-            "criteria": seg.criteria,
-            "customer_count": len(seg.customer_ids or []),
-            "send_time": seg.send_time,
-            "predicted_open_rate": seg.predicted_open_rate,
-            "predicted_click_rate": seg.predicted_click_rate,
-            "variants": variants_data,
-        })
-
-    agent_logs = [
-        {
-            "id": log.id,
-            "agent_name": log.agent_name,
-            "step": log.step,
-            "llm_reasoning": log.llm_reasoning,
-            "created_at": log.created_at.isoformat(),
-        }
-        for log in sorted(campaign.agent_logs, key=lambda l: l.created_at)
-    ]
-
-    return {
-        "campaign_id": campaign.id,
-        "brief": campaign.brief,
-        "status": campaign.status.value,
-        "segments": segments_data,
-        "agent_logs": agent_logs,
-        "created_at": campaign.created_at.isoformat(),
-        "updated_at": campaign.updated_at.isoformat() if campaign.updated_at else None,
-    }
-
+from workflows.langgraph_flow import run_campaign_workflow, resume_campaign_workflow
 
 
 # ── Workflow runner ───────────────────────────────────────────────────────────
@@ -98,6 +29,14 @@ def _run_campaign_workflow(campaign_id: str, brief: str):
         run_campaign_workflow(campaign_id=campaign_id, brief=brief)
     except Exception as exc:
         logger.error("Workflow failed for campaign %s: %s", campaign_id, exc)
+
+
+def _resume_workflow_async(campaign_id: str):
+    """Background task: resumes LangGraph execution."""
+    try:
+        resume_campaign_workflow(campaign_id)
+    except Exception as exc:
+        logger.error("Workflow resumption failed for campaign %s: %s", campaign_id, exc)
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -132,6 +71,24 @@ def get_campaign_status(campaign_id: str, db: Session = Depends(get_db)):
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
     return _serialize_campaign(campaign)
+
+
+@router.post("/campaigns/{campaign_id}/optimize")
+def optimize_campaign(
+    campaign_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """
+    Trigger the optimization loop (Agent 4: Optimizer).
+    Resumes LangGraph from the Analyst/Optimizer nodes.
+    """
+    campaign = db.query(Campaign).filter(Campaign.id == campaign_id).first()
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    background_tasks.add_task(_resume_workflow_async, campaign_id)
+    return {"campaign_id": campaign_id, "status": "optimizing", "message": "Optimization loop started."}
 
 
 @router.get("/campaigns/{campaign_id}/metrics")

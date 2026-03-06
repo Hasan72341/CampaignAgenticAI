@@ -167,4 +167,5 @@ def _get_llm():
         model=os.environ.get("OLLAMA_MODEL", "glm4:latest"),
         base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
         temperature=0.3,
+        num_predict=4096,
     )

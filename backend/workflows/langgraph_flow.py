@@ -160,13 +160,15 @@ def _reject_handler_node(state: CampaignState) -> CampaignState:
 
 # ── Routing functions ─────────────────────────────────────────────────────────
 
-def _dispatcher_router(state: CampaignState) -> Literal["profiler", "execute_campaign", "reject_handler"]:
+def _dispatcher_router(state: CampaignState) -> Literal["profiler", "execute_campaign", "reject_handler", "analyst"]:
     """Route from START based on campaign status."""
     status = state.get("status")
     if status == CampaignStatus.approved:
         return "execute_campaign"
     if status == CampaignStatus.rejected:
         return "reject_handler"
+    if status in {CampaignStatus.monitoring, CampaignStatus.optimizing}:
+        return "analyst"
     return "profiler"
 
 def _after_generator_router(state: CampaignState) -> Literal["hitl_pause", "generator"]:
@@ -259,7 +261,8 @@ def build_campaign_graph() -> StateGraph:
         {
             "profiler": "profiler",
             "execute_campaign": "execute_campaign",
-            "reject_handler": "reject_handler"
+            "reject_handler": "reject_handler",
+            "analyst": "analyst"
         }
     )
     graph.add_edge("profiler",   "planner")
