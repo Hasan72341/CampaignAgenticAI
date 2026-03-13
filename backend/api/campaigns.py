@@ -20,6 +20,61 @@ from db.models import Campaign, CampaignStatus, Segment, Variant, AgentLog
 from tools.campaign_api_tools import get_campaign_tools
 from workflows.langgraph_flow import run_campaign_workflow, resume_campaign_workflow
 
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+class GenerateCampaignRequest(BaseModel):
+    brief: str
+
+class GenerateCampaignResponse(BaseModel):
+    campaign_id: str
+    status: str
+
+def _serialize_campaign(campaign: Campaign):
+    return {
+        "id": campaign.id,
+        "status": campaign.status.value,
+        "brief": campaign.brief,
+        "created_at": campaign.created_at,
+        "state_checkpoint": campaign.state_checkpoint,
+        "rejection_feedback": campaign.rejection_feedback,
+        "segments": [
+            {
+                "id": seg.id,
+                "label": seg.label,
+                "criteria": seg.criteria,
+                "send_time": seg.send_time,
+                "predicted_open_rate": seg.predicted_open_rate,
+                "predicted_click_rate": seg.predicted_click_rate,
+                "variants": [
+                    {
+                        "id": var.id,
+                        "external_campaign_id": var.external_campaign_id,
+                        "subject": var.subject,
+                        "body": var.body,
+                        "has_emoji": var.has_emoji,
+                        "has_url": var.has_url,
+                        "font_styles": var.font_styles,
+                        "sent_count": var.sent_count,
+                        "open_count": var.open_count,
+                        "click_count": var.click_count,
+                    }
+                    for var in seg.variants
+                ]
+            }
+            for seg in campaign.segments
+        ] if campaign.segments else [],
+        "agent_logs": [
+            {
+                "id": log.id,
+                "agent_name": log.agent_name,
+                "step": log.step,
+                "llm_reasoning": log.llm_reasoning,
+                "created_at": log.created_at
+            }
+            for log in campaign.agent_logs
+        ] if campaign.agent_logs else []
+    }
 
 # ── Workflow runner ───────────────────────────────────────────────────────────
 

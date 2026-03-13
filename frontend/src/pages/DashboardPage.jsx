@@ -4,7 +4,7 @@ import { campaignApi } from '../services/api';
 import TimelineNode from '../components/TimelineNode';
 import MetricsChart from '../components/MetricsChart';
 import VariantCard from '../components/VariantCard';
-import { Loader2, RefreshCw, Activity, ArrowRight, Server, Database, ActivitySquare } from 'lucide-react';
+import { Loader2, RefreshCw, Activity, ArrowRight, Server, Database, ActivitySquare, AlertTriangle } from 'lucide-react';
 import clsx from 'clsx';
 
 export default function DashboardPage() {
