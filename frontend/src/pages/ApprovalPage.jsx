@@ -70,8 +70,9 @@ export default function ApprovalPage() {
     }
 
     const state = sessionData.state_checkpoint;
+    const segments = sessionData.segments || [];
     const metrics = sessionData.metrics || {};
-    const totalCustomers = Object.values(state.segments || {}).reduce((acc, seg) => acc + (seg.customer_ids?.length || 0), 0);
+    const totalCustomers = segments.reduce((acc, seg) => acc + (seg.customer_ids?.length || 0), 0);
 
     return (
         <div className="max-w-7xl mx-auto p-6 pb-24 space-y-8">
@@ -93,15 +94,15 @@ export default function ApprovalPage() {
                     {/* API Rate Limit Notice (Mocked for UI via metrics if available, or static warning) */}
                     <div className="flex items-center space-x-1 text-xs text-amber-600 bg-amber-50 px-2 py-1 rounded border border-amber-200">
                         <AlertTriangle className="w-3 h-3" />
-                        <span>Approving will consume {Object.keys(state.segments || {}).length} `/send_campaign` API calls.</span>
+                        <span>Approving will consume {segments.length} `/send_campaign` API calls.</span>
                     </div>
                 </div>
             </div>
 
             {/* Segments & Variants View */}
             <div className="space-y-12">
-                {Object.entries(state.segments || {}).map(([segKey, segment]) => (
-                    <div key={segKey} className="bg-white rounded-xl shadow-sm border overflow-hidden">
+                {segments.map((segment, idx) => (
+                    <div key={segment.id || idx} className="bg-white rounded-xl shadow-sm border overflow-hidden">
                         <div className="bg-gray-50 border-b px-6 py-4 flex justify-between items-center">
                             <h3 className="text-lg font-bold text-gray-800">{segment.label}</h3>
                             <span className="text-sm font-medium text-gray-500 bg-white px-3 py-1 rounded-full border">

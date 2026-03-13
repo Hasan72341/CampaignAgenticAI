@@ -43,6 +43,7 @@ def _serialize_campaign(campaign: Campaign):
                 "id": seg.id,
                 "label": seg.label,
                 "criteria": seg.criteria,
+                "customer_ids": seg.customer_ids,
                 "send_time": seg.send_time,
                 "predicted_open_rate": seg.predicted_open_rate,
                 "predicted_click_rate": seg.predicted_click_rate,
