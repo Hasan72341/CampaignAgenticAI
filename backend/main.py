@@ -2,9 +2,9 @@
 FastAPI application entry point for CampaignX.
 
 Features:
-  - CORS configured for React frontend (localhost:5173)
-  - GET /health — checks DB connectivity
-  - Mounts campaign and approval routers
+    - CORS configured for localhost and OrbStack frontend hosts
+    - GET /health — checks DB connectivity
+    - Mounts campaign and approval routers
 """
 import os
 from contextlib import asynccontextmanager
@@ -34,11 +34,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ── CORS ──────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
+    allow_origins=["*"],
     allow_origin_regex=".*",
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

@@ -103,7 +103,7 @@ class ToolFactory:
                 query_params: Query-string parameters for GET operations.
                 campaign_id_for_log: Optional campaign UUID for AgentLog linkage.
             """
-            endpoint_key = path  # use OpenAPI path as the rate-limit key
+            endpoint_key = quota_key_for_endpoint(path, api_key)
 
             # ── Rate limit check ──────────────────────────────────────
             _check_and_increment_quota(db, endpoint_key)
@@ -244,6 +244,16 @@ def _check_and_increment_quota(db: Session, endpoint: str) -> None:
 
     row.call_count += 1
     db.commit()
+
+
+def quota_key_for_endpoint(endpoint_path: str, api_key: str | None = None) -> str:
+    """
+    Build a quota key that is scoped by endpoint + API key suffix.
+    This prevents one expired/rotated key from blocking new credentials.
+    """
+    key = api_key if api_key is not None else os.environ.get("HACKATHON_API_KEY", "")
+    suffix = (key[-8:] if key else "no_key")
+    return f"{endpoint_path}::{suffix}"
 
 
 def _write_agent_log(

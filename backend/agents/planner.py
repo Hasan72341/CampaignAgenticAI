@@ -7,53 +7,78 @@ Does NOT re-call the external API (quota conservation).
 """
 import json
 import logging
-import os
 from datetime import datetime, timedelta, timezone
 
-from langchain_ollama import ChatOllama
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from sqlalchemy.orm import Session
 
 from db.models import Segment, Campaign, CampaignStatus, CustomerProfile
+from tools.llm_guardrails import build_ollama_llm, invoke_llm_json
+from tools.time_utils import format_future_ist_time, normalize_send_time
 from workflows.state import CampaignState
 
 logger = logging.getLogger(__name__)
 
 # IST = UTC+5:30
 IST_OFFSET = timezone(timedelta(hours=5, minutes=30))
+TIER1_CITIES = {
+    "delhi", "mumbai", "bangalore", "bengaluru",
+    "hyderabad", "chennai", "pune", "kolkata",
+    "ahmedabad", "jaipur", "lucknow", "bhopal", "kochi", "indore",
+}
+
+CRITERIA_KEY_ALIASES = {
+    "age": "age",
+    "gender": "gender",
+    "city": "city",
+    "monthly_income": "monthly_income",
+    "monthly income": "monthly_income",
+    "credit_score": "credit_score",
+    "credit score": "credit_score",
+    "kyc_status": "kyc_status",
+    "kyc status": "kyc_status",
+    "app_installed": "app_installed",
+    "app installed": "app_installed",
+    "existing_customer": "existing_customer",
+    "existing customer": "existing_customer",
+    "social_media_active": "social_media_active",
+    "social media active": "social_media_active",
+    "occupation_type": "occupation_type",
+    "occupation type": "occupation_type",
+    "marital_status": "marital_status",
+    "marital status": "marital_status",
+    "family_size": "family_size",
+    "family size": "family_size",
+    "dependent_count": "dependent_count",
+    "dependent count": "dependent_count",
+    "kids_in_household": "kids_in_household",
+    "kids in household": "kids_in_household",
+}
 
 PLANNER_SYSTEM_PROMPT = """You are the Campaign Planner agent for a digital marketing AI system.
 
-You have access to enriched customer profiles.
-Your task: parse the campaign brief and build an A/B test strategy with 2-3 distinct segments.
+Create 2-3 complementary campaign segments from the provided profile summary.
 
-SCORING CRITICAL RULE:
-- You will define segments using "criteria" (key-value pairs matching customer fields).
-- DO NOT return "customer_ids" in your JSON. The system will assign IDs in Python based on your criteria.
-- Reach 100% of the cohort by defining broad or complementary segments.
-
-General Rules:
-- Read the segment taxonomy carefully.
-- Each segment must have: a label, criteria (dictionary of field:value filters), send_time, and variant_type.
-- send_time MUST be in format 'DD:MM:YY HH:MM:SS' (IST) and MUST be in the future.
-- Use 2 segments minimum, 3 maximum.
-- Assign "variant_type": "A", "B", or "C" to each segment.
-- IMPORTANT: DO NOT use "Infinity" in JSON. If a range has no upper bound, use null or a very large number (999999999).
+Rules:
+- Each segment must include: label, variant_type, criteria, send_time, rationale.
+- send_time format must be DD:MM:YY HH:MM:SS (IST) and in the future.
+- criteria should use provided profile keys (age, city, monthly_income, existing_customer, etc).
+- Do not include customer_ids in output.
 
 Output JSON only:
 {
-  "strategy_rationale": "...",
-  "segments": [
-    {
-      "label": "Segment A – High-Value",
-      "variant_type": "A",
-      "criteria": {"existing_customer": "Y", "kyc_status": "Y", "monthly_income": [100000, null]},
-      "send_time": "DD:MM:YY HH:MM:SS",
-      "rationale": "..."
-    }
-  ]
-}"""
-
+    "strategy_rationale": "...",
+    "segments": [
+        {
+            "label": "Segment A – ...",
+            "variant_type": "A",
+            "criteria": {"existing_customer": "Y"},
+            "send_time": "15:03:26 12:00:00",
+            "rationale": "..."
+        }
+    ]
+}
+"""
 
 def run_planner(state: CampaignState, db: Session) -> CampaignState:
     """LangGraph node: Campaign Planner."""
@@ -95,27 +120,56 @@ def run_planner(state: CampaignState, db: Session) -> CampaignState:
     now_ist = datetime.now(IST_OFFSET)
     now_str  = now_ist.strftime("%d:%m:%y %H:%M:%S")
 
-    llm = _get_llm()
-    messages = [
-        SystemMessage(content=PLANNER_SYSTEM_PROMPT),
-        HumanMessage(content=(
-            f"Campaign Brief: {brief}{rejection_feedback}\n\n"
-            f"Current IST time: {now_str}\n\n"
-            f"Segment taxonomy from Profiler:\n{json.dumps(segment_taxonomy, indent=2)}\n\n"
-            f"Total customers: {len(profiles_summary)}\n"
-            f"Sample profiles (first 5):\n{json.dumps(profiles_summary[:5], indent=2)}\n\n"
-            f"Return ONLY valid JSON dictionary following the schema."
-        )),
+    compact_taxonomy = {
+        k: {
+            "description": v.get("description", ""),
+            "count": v.get("count", 0),
+        }
+        for k, v in list((segment_taxonomy or {}).items())[:20]
+    }
+    compact_profiles = [
+        {
+            "customer_id": p["customer_id"],
+            "age": p["age"],
+            "city": p["city"],
+            "monthly_income": p["monthly_income"],
+            "existing_customer": p["existing_customer"],
+            "social_media_active": p["social_media_active"],
+            "occupation_type": p["occupation_type"],
+            "segment_tag": p["segment_tag"],
+        }
+        for p in profiles_summary[:5]
     ]
 
-    response = llm.invoke(messages)
-    raw_content = _clean_json(response.content)
-
+    llm_used = True
+    fallback_reason = ""
     try:
-        llm_output: dict = json.loads(raw_content)
-    except json.JSONDecodeError:
-        logger.error("[Planner] Invalid JSON from LLM: %s", raw_content[:300])
-        raise ValueError("Planner LLM returned invalid JSON")
+        llm = build_ollama_llm(temperature=0.3, num_predict=1600)
+        llm_output, raw_content = invoke_llm_json(
+            llm,
+            messages=[
+                SystemMessage(content=PLANNER_SYSTEM_PROMPT),
+                HumanMessage(content=(
+                    f"Campaign brief: {brief}{rejection_feedback}\n\n"
+                    f"Current IST time: {now_str}\n\n"
+                    f"Segment taxonomy (compact):\n{json.dumps(compact_taxonomy, indent=2)}\n\n"
+                    f"Total customers: {len(profiles_summary)}\n"
+                    f"Sample profiles:\n{json.dumps(compact_profiles, indent=2)}"
+                )),
+            ],
+            timeout_seconds=120,
+        )
+        if not isinstance(llm_output.get("segments"), list) or not llm_output.get("segments"):
+            raise ValueError("Planner returned empty segments")
+    except Exception as exc:
+        llm_used = False
+        fallback_reason = str(exc)
+        llm_output = _build_deterministic_plan(brief=brief, now_str=now_str)
+        raw_content = json.dumps({
+            "fallback": "deterministic",
+            "reason": fallback_reason,
+            "output": llm_output,
+        }, ensure_ascii=False)
 
     planned_segments = llm_output.get("segments", [])
 
@@ -137,35 +191,19 @@ def run_planner(state: CampaignState, db: Session) -> CampaignState:
         for p in profiles_summary:
             if p["customer_id"] in assigned_ids:
                 continue
-            
-            # Match all criteria (supporting ranges [min, max])
-            matches = True
-            for k, v in criteria.items():
-                p_val = p.get(k)
-                
-                # Support range [min, max]
-                if isinstance(v, list) and len(v) == 2:
-                    low, high = v
-                    # Handle None/Infinity in low
-                    if low is not None and p_val is not None and p_val < low:
-                        matches = False
-                        break
-                    # Handle None/Infinity in high
-                    if high is not None and p_val is not None and p_val > high:
-                        matches = False
-                        break
-                    if p_val is None: # if we have a range but no value, it can't match
-                        matches = False
-                        break
-                else:
-                    # Default equality
-                    if str(p_val).lower() != str(v).lower():
-                        matches = False
-                        break
-            
-            if matches:
+
+            if _profile_matches_criteria(p, criteria):
                 seg_ids.append(p["customer_id"])
                 assigned_ids.add(p["customer_id"])
+
+        # Prevent empty non-final segments when criteria are too strict or noisy.
+        if idx < len(planned_segments) - 1 and not seg_ids:
+            remaining_ids = [p["customer_id"] for p in profiles_summary if p["customer_id"] not in assigned_ids]
+            remaining_segments = max(1, (len(planned_segments) - idx))
+            fallback_take = max(1, len(remaining_ids) // remaining_segments)
+            fallback_ids = remaining_ids[:fallback_take]
+            seg_ids.extend(fallback_ids)
+            assigned_ids.update(fallback_ids)
 
         # If it's the LAST segment, grab any remaining customers to ensure 100% coverage
         if idx == len(planned_segments) - 1:
@@ -179,7 +217,7 @@ def run_planner(state: CampaignState, db: Session) -> CampaignState:
             label=seg_data.get("label", "Unnamed"),
             criteria=_sanitize_criteria(criteria),
             customer_ids=seg_ids,
-            send_time=seg_data.get("send_time"),
+            send_time=normalize_send_time(seg_data.get("send_time")),
         )
         db.add(seg)
         db.flush()
@@ -206,6 +244,8 @@ def run_planner(state: CampaignState, db: Session) -> CampaignState:
         output_payload={
             "strategy_rationale": llm_output.get("strategy_rationale", ""),
             "segment_count": len(segment_dicts),
+            "llm_used": llm_used,
+            "fallback_reason": fallback_reason or None,
         },
         llm_reasoning=raw_content,
     )
@@ -245,6 +285,79 @@ def _sanitize_criteria(criteria: dict) -> dict:
     return clean
 
 
+def _profile_matches_criteria(profile: dict, criteria: dict) -> bool:
+    """Return True when a customer profile satisfies all planner criteria."""
+    for key, criterion in criteria.items():
+        normalized_key = _normalize_criteria_key(key)
+        profile_value = profile.get(normalized_key)
+
+        # Numeric range criteria, e.g. [200000, null]
+        if isinstance(criterion, list) and len(criterion) == 2 and all(
+            x is None or isinstance(x, (int, float)) for x in criterion
+        ):
+            if profile_value is None:
+                return False
+            low, high = criterion
+            if low is not None and profile_value < low:
+                return False
+            if high is not None and profile_value > high:
+                return False
+            continue
+
+        # Multi-value criteria, e.g. ["tier1_city", "mumbai"]
+        if isinstance(criterion, list):
+            if not any(_value_matches(normalized_key, profile_value, c) for c in criterion):
+                return False
+            continue
+
+        if not _value_matches(normalized_key, profile_value, criterion):
+            return False
+
+    return True
+
+
+def _value_matches(key: str, profile_value, criterion) -> bool:
+    """Match one profile value to one criterion with lightweight normalization."""
+    if profile_value is None:
+        return False
+
+    key_norm = str(key).strip().lower()
+    profile_norm = str(profile_value).strip().lower()
+    criterion_norm = str(criterion).strip().lower()
+
+    profile_norm = _normalize_boolean_like(profile_norm)
+    criterion_norm = _normalize_boolean_like(criterion_norm)
+
+    if key_norm == "city" and criterion_norm in {
+        "tier1_city", "tier-1", "tier1", "tier-1 city", "tier1 city", "tier-1 cities", "tier1 cities"
+    }:
+        return profile_norm in TIER1_CITIES
+
+    if key_norm == "occupation_type" and criterion_norm in {"professional", "salaried", "young professionals", "young professional"}:
+        return profile_norm in {"full-time", "full time", "professional", "salaried"}
+
+    if key_norm == "city" and criterion_norm.replace("-", " ") in profile_norm:
+        return True
+
+    return profile_norm == criterion_norm
+
+
+def _normalize_boolean_like(value: str) -> str:
+    """Normalize yes/no style variants for matching."""
+    v = value.strip().lower()
+    if v in {"yes", "true", "1"}:
+        return "y"
+    if v in {"no", "false", "0"}:
+        return "n"
+    return v
+
+
+def _normalize_criteria_key(key: str) -> str:
+    """Map planner criteria keys to normalized profile keys."""
+    raw = str(key).strip().lower().replace("_", " ")
+    return CRITERIA_KEY_ALIASES.get(raw, raw.replace(" ", "_"))
+
+
 def _update_campaign_status(db: Session, campaign_id: str, status: CampaignStatus):
     db.query(Campaign).filter(Campaign.id == campaign_id).update(
         {"status": status, "updated_at": datetime.utcnow()}
@@ -273,10 +386,44 @@ def _clean_json(text: str) -> str:
     return text.strip()
 
 
-def _get_llm():
-    return ChatOllama(
-        model=os.environ.get("OLLAMA_MODEL", "glm4:latest"),
-        base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
-        temperature=0.3,
-        num_predict=4096,
-    )
+def _build_deterministic_plan(brief: str, now_str: str) -> dict:
+    """Generate a stable 3-segment plan without relying on an external LLM."""
+    return {
+        "strategy_rationale": (
+            "Deterministic fallback strategy balancing young Tier-1 prospects, "
+            "high-income digital users, and existing customers."
+        ),
+        "segments": [
+            {
+                "label": "Segment A – Young Tier-1 Professionals",
+                "variant_type": "A",
+                "criteria": {
+                    "age": [20, 35],
+                    "city": ["tier1_city"],
+                    "occupation_type": "professional",
+                },
+                "send_time": normalize_send_time(format_future_ist_time(45)),
+                "rationale": "Acquire young professionals in Tier-1 cities with energetic messaging.",
+            },
+            {
+                "label": "Segment B – High-Income Digital Customers",
+                "variant_type": "B",
+                "criteria": {
+                    "monthly_income": [200000, None],
+                    "social_media_active": "Y",
+                },
+                "send_time": normalize_send_time(format_future_ist_time(90)),
+                "rationale": "Target affluent digitally active users with premium value framing.",
+            },
+            {
+                "label": "Segment C – Existing Customers",
+                "variant_type": "C",
+                "criteria": {
+                    "existing_customer": "Y",
+                },
+                "send_time": normalize_send_time(format_future_ist_time(135)),
+                "rationale": "Retain and upsell known customers with trust-based communication.",
+            },
+        ],
+        "metadata": {"brief": brief, "generated_at_ist": now_str},
+    }

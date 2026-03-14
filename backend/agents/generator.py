@@ -11,52 +11,46 @@ Content rules (Section 6.4 + API schema):
 """
 import json
 import logging
-import os
 import re
 from datetime import datetime, timezone, timedelta
 
-from langchain_ollama import ChatOllama
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from sqlalchemy.orm import Session
 
 from db.models import Variant, Segment, AgentLog, Campaign, CampaignStatus
 from ml.engagement_predictor import score_segment
+from tools.llm_guardrails import build_ollama_llm, invoke_llm_json
+from tools.time_utils import format_future_ist_time, normalize_send_time
 from workflows.state import CampaignState
 
 logger = logging.getLogger(__name__)
 
 GENERATOR_SYSTEM_PROMPT = """You are the Content Generator agent for a digital marketing AI system.
 
-You must create email campaign variants for each customer segment.
+Create one email variant per input segment.
 
-STRICT CONTENT RULES (violations cause immediate API rejection):
-1. subject: text and emojis ONLY. Max 200 characters. NO URLs. NO HTML tags.
-2. body: text, emojis (UTF-8), and one URL allowed. Max 5000 characters. NO HTML tags.
-3. The only allowed URL in the body is: https://superbfsi.com/xdeposit/explore/
-4. send_time must be 'DD:MM:YY HH:MM:SS' IST and STRICTLY in the future.
-
-CREATIVE GUIDELINES:
-- Make the subject line punchy. 30-60 chars is optimal. Include 1-2 emojis.
-- Body: be concise (<400 chars), include a clear call-to-action, place the URL near the end.
-- Personalise tone based on segment (high-income → premium tone, young → energetic tone).
-- Use **bold**, _italic_ for emphasis (plain text markers only, no HTML).
+Rules:
+- subject: text + emoji only, <= 200 chars, no URL, no HTML
+- body: plain text with optional emoji and URL, <= 5000 chars, no HTML
+- allowed URL: https://superbfsi.com/xdeposit/explore/
+- send_time must be DD:MM:YY HH:MM:SS in future IST
 
 Output JSON only:
 {
-  "variants": [
-    {
-      "target_segment_id": "<uuid>",
-      "variant_type": "A",
-      "subject": "...",
-      "body": "...",
-      "send_time": "DD:MM:YY HH:MM:SS",
-      "has_emoji": true,
-      "has_url": true,
-      "generation_rationale": "..."
-    }
-  ]
-}"""
-
+    "variants": [
+        {
+            "target_segment_id": "<uuid>",
+            "variant_type": "A",
+            "subject": "...",
+            "body": "...",
+            "send_time": "15:03:26 12:00:00",
+            "has_emoji": true,
+            "has_url": true,
+            "generation_rationale": "..."
+        }
+    ]
+}
+"""
 
 def run_generator(state: CampaignState, db: Session) -> CampaignState:
     """LangGraph node: Content Generator."""
@@ -80,25 +74,33 @@ def run_generator(state: CampaignState, db: Session) -> CampaignState:
     # Strip customer_ids to avoid massive context for LLM
     clean_segments = [{k: v for k, v in s.items() if k != "customer_ids"} for s in segments]
 
-    llm = _get_llm()
-    messages = [
-        SystemMessage(content=GENERATOR_SYSTEM_PROMPT),
-        HumanMessage(content=(
-            f"Campaign Brief: {brief}{strategy_addendum}\n\n"
-            f"Current IST time: {now_str}\n\n"
-            f"Segments to generate content for:\n{json.dumps(clean_segments, indent=2)}\n\n"
-            f"For each segment, generate one variant. Return ONLY valid JSON."
-        )),
-    ]
-
-    response = llm.invoke(messages)
-    raw_content = _clean_json(response.content)
-
+    llm_used = True
+    fallback_reason = ""
     try:
-        llm_output: dict = json.loads(raw_content)
-    except json.JSONDecodeError:
-        logger.error("[Generator] Invalid JSON from LLM: %s", raw_content[:300])
-        raise ValueError("Generator LLM returned invalid JSON")
+        llm = build_ollama_llm(temperature=0.7, num_predict=1800)
+        llm_output, raw_content = invoke_llm_json(
+            llm,
+            messages=[
+                SystemMessage(content=GENERATOR_SYSTEM_PROMPT),
+                HumanMessage(content=(
+                    f"Campaign brief: {brief}{strategy_addendum}\n\n"
+                    f"Current IST time: {now_str}\n\n"
+                    f"Segments:\n{json.dumps(clean_segments, indent=2)}"
+                )),
+            ],
+            timeout_seconds=120,
+        )
+        if not isinstance(llm_output.get("variants"), list) or not llm_output.get("variants"):
+            raise ValueError("Generator returned empty variants")
+    except Exception as exc:
+        llm_used = False
+        fallback_reason = str(exc)
+        llm_output = _build_deterministic_variants(clean_segments)
+        raw_content = json.dumps({
+            "fallback": "deterministic",
+            "reason": fallback_reason,
+            "output": llm_output,
+        }, ensure_ascii=False)
 
     raw_variants = llm_output.get("variants", [])
 
@@ -137,7 +139,7 @@ def run_generator(state: CampaignState, db: Session) -> CampaignState:
         seg_customer_ids = set(seg_row.customer_ids or [])
         seg_profiles = [p for p in customer_profiles if p.get("customer_id") in seg_customer_ids]
 
-        send_time = v_data.get("send_time", seg_row.send_time or "")
+        send_time = normalize_send_time(v_data.get("send_time") or seg_row.send_time)
         prediction = score_segment(
             customer_profiles=seg_profiles or customer_profiles[:100],
             variant={"subject": subject, "body": body, "has_emoji": variant.has_emoji, "has_url": variant.has_url},
@@ -147,8 +149,7 @@ def run_generator(state: CampaignState, db: Session) -> CampaignState:
         # Store prediction in Segment row
         seg_row.predicted_open_rate  = prediction["mean_open_rate"]
         seg_row.predicted_click_rate = prediction["mean_click_rate"]
-        if not seg_row.send_time:
-            seg_row.send_time = send_time
+        seg_row.send_time = send_time
 
         variant_dicts.append({
             "id":                variant.id,
@@ -171,7 +172,11 @@ def run_generator(state: CampaignState, db: Session) -> CampaignState:
         agent_name="ContentGenerator",
         step=3,
         input_payload={"segment_count": len(segments), "iteration": state.get("iteration", 1)},
-        output_payload={"variant_count": len(variant_dicts)},
+        output_payload={
+            "variant_count": len(variant_dicts),
+            "llm_used": llm_used,
+            "fallback_reason": fallback_reason or None,
+        },
         llm_reasoning=raw_content,
     )
 
@@ -234,10 +239,49 @@ def _clean_json(text: str) -> str:
     return text.strip()
 
 
-def _get_llm():
-    return ChatOllama(
-        model=os.environ.get("OLLAMA_MODEL", "glm4:latest"),
-        base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
-        temperature=0.7,  # higher for creative copy
-        num_predict=4096,
-    )
+def _build_deterministic_variants(segments: list[dict]) -> dict:
+    """Generate one standards-compliant variant per segment without LLM calls."""
+    variants = []
+    fallback_send_time = format_future_ist_time(60)
+
+    for idx, seg in enumerate(segments):
+        label = str(seg.get("label") or f"Segment {idx + 1}")
+        seg_id = seg.get("id")
+        variant_type = seg.get("variant_type") or chr(ord("A") + idx)
+        send_time = normalize_send_time(seg.get("send_time") or fallback_send_time)
+
+        label_lower = label.lower()
+        if "high-income" in label_lower or "high income" in label_lower:
+            subject = "Premium Deposit Benefits Await You 💼"
+            body = (
+                "**Grow your wealth with confidence.** Unlock premium deposit benefits "
+                "crafted for your goals. **Claim today** at "
+                "https://superbfsi.com/xdeposit/explore/"
+            )
+        elif "existing" in label_lower:
+            subject = "Exclusive Deposit Offer for You 🤝"
+            body = (
+                "**Thanks for banking with us.** Your personalised deposit offer is live. "
+                "**Tap now** and activate it at "
+                "https://superbfsi.com/xdeposit/explore/"
+            )
+        else:
+            subject = "Start Saving Smarter Today 🚀"
+            body = (
+                "**Build your future faster.** Discover flexible deposit options and "
+                "strong returns. **Explore now** at "
+                "https://superbfsi.com/xdeposit/explore/"
+            )
+
+        variants.append({
+            "target_segment_id": seg_id,
+            "variant_type": variant_type,
+            "subject": subject,
+            "body": body,
+            "send_time": send_time,
+            "has_emoji": True,
+            "has_url": True,
+            "generation_rationale": f"Deterministic copy for {label}",
+        })
+
+    return {"variants": variants}

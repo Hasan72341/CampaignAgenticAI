@@ -48,6 +48,11 @@ export const campaignApi = {
         return response.data;
     },
 
+    getCampaignStatusSummary: async (id) => {
+        const response = await api.get(`/api/campaigns/${id}/status-summary`);
+        return response.data;
+    },
+
     approveCampaign: async (id) => {
         const response = await api.post(`/api/campaigns/${id}/approve`);
         return response.data;

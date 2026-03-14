@@ -33,7 +33,7 @@ export default function BriefPage() {
 
         const interval = setInterval(async () => {
             try {
-                const data = await campaignApi.getCampaignStatus(campaignId);
+                const data = await campaignApi.getCampaignStatusSummary(campaignId);
                 setCurrentStatus(data.status);
 
                 if (data.status === 'pending_approval') {

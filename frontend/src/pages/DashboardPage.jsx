@@ -14,7 +14,8 @@ import {
     Target,
     ArrowUpRight,
     ChevronDown,
-    Cpu
+    Cpu,
+    CheckSquare
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import clsx from 'clsx';
@@ -44,7 +45,6 @@ export default function DashboardPage() {
     const [data, setData] = useState(null);
     const [metrics, setMetrics] = useState(null);
     const [loading, setLoading] = useState(true);
-    const [optimizeLoading, setOptimizeLoading] = useState(false);
     const [selectedNode, setSelectedNode] = useState(null);
 
     const loadData = async () => {
@@ -114,6 +114,9 @@ export default function DashboardPage() {
     const totalSent = (metrics || []).reduce((acc, v) => acc + (v.total_sent || 0), 0);
     const avgOpen = metrics?.length ? (metrics.reduce((acc, v) => acc + (v.open_rate || 0), 0) / metrics.length).toFixed(1) : "0.0";
     const avgClick = metrics?.length ? (metrics.reduce((acc, v) => acc + (v.click_rate || 0), 0) / metrics.length).toFixed(1) : "0.0";
+    const campaignStatus = data?.status || 'unknown';
+    const statusText = campaignStatus.replace('_', ' ');
+    const isAwaitingReview = campaignStatus === 'pending_approval';
 
     const stats = [
         { id: 'reach', label: 'Mandate Coverage', value: totalSent, icon: Target, trend: 'Cohort Alpha' },
@@ -137,6 +140,14 @@ export default function DashboardPage() {
                 </div>
 
                 <div className="flex gap-4">
+                    <div className={clsx(
+                        "px-4 py-2 rounded-xl border text-xs font-black uppercase tracking-widest",
+                        isAwaitingReview
+                            ? "bg-amber-50 text-amber-700 border-amber-200"
+                            : "bg-emerald-50 text-emerald-700 border-emerald-200"
+                    )}>
+                        {statusText}
+                    </div>
                     <div className="bg-white border border-slate-200 px-4 py-2 rounded-xl flex items-center gap-3">
                         <Database className="w-4 h-4 text-slate-400" />
                         <span className="text-xs font-bold text-slate-600">TX-ID: {id?.substring(0, 8)}</span>
@@ -149,6 +160,24 @@ export default function DashboardPage() {
                     </button>
                 </div>
             </header>
+
+            {isAwaitingReview && (
+                <div className="shrink-0 rounded-2xl border border-amber-200 bg-amber-50 px-6 py-4 flex items-center justify-between">
+                    <div className="flex items-center gap-3 text-amber-800">
+                        <CheckSquare className="w-5 h-5" />
+                        <div>
+                            <p className="text-sm font-black uppercase tracking-widest">Human Review Required</p>
+                            <p className="text-xs font-semibold">The next optimization iteration is ready. Approve or reject to continue agentic execution.</p>
+                        </div>
+                    </div>
+                    <Link
+                        to={`/approval/${id}`}
+                        className="px-4 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-xs font-black uppercase tracking-widest transition-colors"
+                    >
+                        Open Review
+                    </Link>
+                </div>
+            )}
 
             {/* Main Grid */}
             <div className="flex-1 grid grid-cols-12 gap-8 min-h-0">
@@ -242,7 +271,7 @@ export default function DashboardPage() {
                                         log.agent_name === "CampaignPlanner" ? "Strategy" :
                                             log.agent_name === "ContentGenerator" ? "Creative" :
                                                 log.agent_name === "PerformanceAnalyst" ? "Analytics" :
-                                                    log.agent_name === "StrategyOptimizer" ? "Growth" : "Phase " + (i + 1)}
+                                                    log.agent_name === "Optimizer" || log.agent_name === "StrategyOptimizer" ? "Growth" : "Phase " + (i + 1)}
                                 </button>
                             ))}
                         </div>

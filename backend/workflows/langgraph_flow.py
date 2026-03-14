@@ -33,6 +33,7 @@ from agents.generator import run_generator
 from agents.analyst   import run_analyst
 from agents.optimizer import run_optimizer
 from tools.campaign_api_tools import get_campaign_tools
+from tools.time_utils import normalize_send_time
 
 logger = logging.getLogger(__name__)
 
@@ -87,9 +88,10 @@ def _execute_campaign_node(state: CampaignState) -> CampaignState:
         _update_status(db, campaign_id, CampaignStatus.executing)
 
         for seg in db.query(Segment).filter(Segment.campaign_id == campaign_id).all():
+            seg.send_time = normalize_send_time(seg.send_time)
             for variant in seg.variants:
-                if not (seg.customer_ids and seg.send_time):
-                    logger.warning("[Execute] Segment %s missing customer_ids or send_time — skipping", seg.id)
+                if not seg.customer_ids:
+                    logger.warning("[Execute] Segment %s missing customer_ids — skipping", seg.id)
                     continue
 
                 payload = {
@@ -114,6 +116,8 @@ def _execute_campaign_node(state: CampaignState) -> CampaignState:
                         logger.info("[Execute] Sent to segment %s → external_id %s", seg.label, ext_id)
                 except Exception as exc:
                     logger.error("[Execute] Failed for segment %s: %s", seg.label, exc)
+
+            db.commit()
 
         _update_status(db, campaign_id, CampaignStatus.monitoring)
         return {**state, "status": "monitoring"}

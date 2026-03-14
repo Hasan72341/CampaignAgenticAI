@@ -8,7 +8,7 @@ Routes:
 """
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
@@ -16,8 +16,9 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from db.database import get_db
-from db.models import Campaign, CampaignStatus, Segment, Variant, AgentLog
+from db.models import Campaign, CampaignStatus, Segment, Variant, AgentLog, ApiCallLog
 from tools.campaign_api_tools import get_campaign_tools
+from tools.openapi_tool_factory import quota_key_for_endpoint
 from workflows.langgraph_flow import run_campaign_workflow, resume_campaign_workflow
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,21 @@ class GenerateCampaignRequest(BaseModel):
 class GenerateCampaignResponse(BaseModel):
     campaign_id: str
     status: str
+
+
+def _serialize_campaign_status_summary(campaign: Campaign):
+    segments = campaign.segments or []
+    variants = [v for s in segments for v in (s.variants or [])]
+    return {
+        "id": campaign.id,
+        "status": campaign.status.value,
+        "brief": campaign.brief,
+        "created_at": campaign.created_at,
+        "rejection_feedback": campaign.rejection_feedback,
+        "segment_count": len(segments),
+        "variant_count": len(variants),
+        "has_pending_review": campaign.status == CampaignStatus.pending_approval,
+    }
 
 def _serialize_campaign(campaign: Campaign):
     return {
@@ -138,6 +154,15 @@ def get_campaign_status(campaign_id: str, db: Session = Depends(get_db)):
     return _serialize_campaign(campaign)
 
 
+@router.get("/campaigns/{campaign_id}/status-summary")
+def get_campaign_status_summary(campaign_id: str, db: Session = Depends(get_db)):
+    """Lightweight status payload intended for frequent UI polling."""
+    campaign = db.query(Campaign).filter(Campaign.id == campaign_id).first()
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return _serialize_campaign_status_summary(campaign)
+
+
 @router.post("/campaigns/{campaign_id}/optimize")
 def optimize_campaign(
     campaign_id: str,
@@ -157,10 +182,11 @@ def optimize_campaign(
 
 
 @router.get("/campaigns/{campaign_id}/metrics")
-def get_campaign_metrics(campaign_id: str, db: Session = Depends(get_db)):
+def get_campaign_metrics(campaign_id: str, refresh: bool = False, db: Session = Depends(get_db)):
     """
-    Return live open/click metrics for all variants of a campaign.
-    Fetches from the hackathon API via the ToolFactory GET /get_report tool.
+    Return open/click metrics for all variants of a campaign.
+    By default this serves cached metrics from DB to avoid exhausting API quota.
+    Pass refresh=true to fetch live metrics from the hackathon API.
     """
     campaign = db.query(Campaign).filter(Campaign.id == campaign_id).first()
     if not campaign:
@@ -169,13 +195,30 @@ def get_campaign_metrics(campaign_id: str, db: Session = Depends(get_db)):
     metrics = []
     tools = {t.name: t for t in get_campaign_tools(db)}
     get_report_tool = tools.get("get_report_api_v1_get_report_get")
+    report_path = quota_key_for_endpoint("/api/v1/get_report")
+    used_row = (
+        db.query(ApiCallLog)
+        .filter(ApiCallLog.endpoint == report_path, ApiCallLog.date_utc == date.today())
+        .first()
+    )
+    report_calls_used = used_row.call_count if used_row else 0
+    quota_exhausted = report_calls_used >= 100
+    allow_live_fetch = bool(refresh and get_report_tool and not quota_exhausted)
+
+    dirty = False
 
     for seg in campaign.segments:
         for variant in seg.variants:
             if not variant.external_campaign_id:
                 continue
+
+            total = variant.sent_count or 0
+            open_count = variant.open_count or 0
+            click_count = variant.click_count or 0
+            source = "cached"
+
             try:
-                if get_report_tool:
+                if allow_live_fetch:
                     report = get_report_tool.invoke({
                         "query_params": {"campaign_id": variant.external_campaign_id},
                         "campaign_id_for_log": campaign_id,
@@ -184,26 +227,43 @@ def get_campaign_metrics(campaign_id: str, db: Session = Depends(get_db)):
                     open_count  = sum(1 for r in rows if r.get("EO") == "Y")
                     click_count = sum(1 for r in rows if r.get("EC") == "Y")
                     total = report.get("total_rows", len(rows))
-                    # Persist to DB
+
+                    # Persist refreshed values to DB once per request.
                     variant.sent_count  = total
                     variant.open_count  = open_count
                     variant.click_count = click_count
-                    db.commit()
-                    metrics.append({
-                        "variant_id": variant.id,
-                        "external_campaign_id": variant.external_campaign_id,
-                        "segment_label": seg.label,
-                        "total_sent": total,
-                        "open_count": open_count,
-                        "click_count": click_count,
-                        "open_rate": round(open_count / total * 100, 2) if total else 0,
-                        "click_rate": round(click_count / total * 100, 2) if total else 0,
-                        "weighted_score": round(
-                            (click_count / total * 100 * 0.70) + (open_count / total * 100 * 0.30), 2
-                        ) if total else 0,
-                    })
+                    source = "live"
+                    dirty = True
             except Exception as exc:
-                logger.error("Failed to fetch metrics for variant %s: %s", variant.id, exc)
-                metrics.append({"variant_id": variant.id, "error": str(exc)})
+                logger.warning(
+                    "Live metrics fetch failed for variant %s, serving cached values instead: %s",
+                    variant.id,
+                    exc,
+                )
 
-    return {"campaign_id": campaign_id, "metrics": metrics}
+            metrics.append({
+                "variant_id": variant.id,
+                "external_campaign_id": variant.external_campaign_id,
+                "segment_label": seg.label,
+                "total_sent": total,
+                "open_count": open_count,
+                "click_count": click_count,
+                "open_rate": round(open_count / total * 100, 2) if total else 0,
+                "click_rate": round(click_count / total * 100, 2) if total else 0,
+                "weighted_score": round(
+                    (click_count / total * 100 * 0.70) + (open_count / total * 100 * 0.30), 2
+                ) if total else 0,
+                "source": source,
+            })
+
+    if dirty:
+        db.commit()
+
+    return {
+        "campaign_id": campaign_id,
+        "metrics": metrics,
+        "refresh": refresh,
+        "live_fetch_enabled": allow_live_fetch,
+        "get_report_calls_used_today": report_calls_used,
+        "get_report_daily_limit": 100,
+    }

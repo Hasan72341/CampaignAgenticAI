@@ -10,14 +10,15 @@ EO and EC are STRING flags 'Y'|'N' — NOT booleans.
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, date
 
 from langchain_ollama import ChatOllama
 from langchain_core.messages import SystemMessage, HumanMessage
 from sqlalchemy.orm import Session
 
-from db.models import Variant, Segment, AgentLog, Campaign, CampaignStatus
+from db.models import Variant, Segment, AgentLog, Campaign, CampaignStatus, ApiCallLog
 from tools.campaign_api_tools import get_campaign_tools
+from tools.openapi_tool_factory import quota_key_for_endpoint
 from workflows.state import CampaignState
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,14 @@ def run_analyst(state: CampaignState, db: Session) -> CampaignState:
 
     tools_map = {t.name: t for t in get_campaign_tools(db)}
     report_tool = tools_map.get("get_report_api_v1_get_report_get")
+    report_path = quota_key_for_endpoint("/api/v1/get_report")
+    report_log = (
+        db.query(ApiCallLog)
+        .filter(ApiCallLog.endpoint == report_path, ApiCallLog.date_utc == date.today())
+        .first()
+    )
+    report_calls_used = report_log.call_count if report_log else 0
+    can_fetch_live_reports = bool(report_tool and report_calls_used < 100)
 
     # ── Fetch metrics for all variants ────────────────────────────────────────
     metrics_by_segment: dict[str, dict] = {}
@@ -65,28 +74,35 @@ def run_analyst(state: CampaignState, db: Session) -> CampaignState:
                 logger.info("[Analyst] Variant %s has no external_campaign_id — skipping", variant.id)
                 continue
 
+            total = variant.sent_count or 0
+            open_count = variant.open_count or 0
+            click_count = variant.click_count or 0
+            data_source = "cached"
+
             try:
-                report = report_tool.invoke({
-                    "body": None,
-                    "query_params": {"campaign_id": variant.external_campaign_id},
-                    "campaign_id_for_log": campaign_id,
-                })
-                rows = report.get("data", [])
-                total = report.get("total_rows", len(rows))
+                if can_fetch_live_reports:
+                    report = report_tool.invoke({
+                        "body": None,
+                        "query_params": {"campaign_id": variant.external_campaign_id},
+                        "campaign_id_for_log": campaign_id,
+                    })
+                    rows = report.get("data", [])
+                    total = report.get("total_rows", len(rows))
 
-                # EO and EC are STRING flags 'Y'|'N'
-                open_count  = sum(1 for r in rows if r.get("EO") == "Y")
-                click_count = sum(1 for r in rows if r.get("EC") == "Y")
+                    # EO and EC are STRING flags 'Y'|'N'
+                    open_count = sum(1 for r in rows if r.get("EO") == "Y")
+                    click_count = sum(1 for r in rows if r.get("EC") == "Y")
 
-                open_rate   = round(open_count / total, 4) if total else 0.0
-                click_rate  = round(click_count / total, 4) if total else 0.0
-                weighted    = round(click_rate * 0.70 + open_rate * 0.30, 4)
+                    # Persist to Variant row
+                    variant.sent_count = total
+                    variant.open_count = open_count
+                    variant.click_count = click_count
+                    db.commit()
+                    data_source = "live"
 
-                # Persist to Variant row
-                variant.sent_count  = total
-                variant.open_count  = open_count
-                variant.click_count = click_count
-                db.commit()
+                open_rate = round(open_count / total, 4) if total else 0.0
+                click_rate = round(click_count / total, 4) if total else 0.0
+                weighted = round(click_rate * 0.70 + open_rate * 0.30, 4)
 
                 seg_key = str(seg.id)
                 if seg_key not in metrics_by_segment:
@@ -105,10 +121,37 @@ def run_analyst(state: CampaignState, db: Session) -> CampaignState:
                     "click_rate":          click_rate,
                     "weighted_score":      weighted,
                     "subject_preview":     (variant.subject or "")[:80],
+                    "source":              data_source,
                 })
 
             except Exception as exc:
-                logger.error("[Analyst] Failed to fetch report for variant %s: %s", variant.id, exc)
+                if "Rate limit reached" in str(exc):
+                    can_fetch_live_reports = False
+                logger.warning("[Analyst] Falling back to cached metrics for variant %s: %s", variant.id, exc)
+
+                open_rate = round(open_count / total, 4) if total else 0.0
+                click_rate = round(click_count / total, 4) if total else 0.0
+                weighted = round(click_rate * 0.70 + open_rate * 0.30, 4)
+
+                seg_key = str(seg.id)
+                if seg_key not in metrics_by_segment:
+                    metrics_by_segment[seg_key] = {
+                        "segment_label": seg.label,
+                        "variants": [],
+                    }
+
+                metrics_by_segment[seg_key]["variants"].append({
+                    "variant_id": str(variant.id),
+                    "external_campaign_id": variant.external_campaign_id,
+                    "total_sent": total,
+                    "open_count": open_count,
+                    "click_count": click_count,
+                    "open_rate": open_rate,
+                    "click_rate": click_rate,
+                    "weighted_score": weighted,
+                    "subject_preview": (variant.subject or "")[:80],
+                    "source": "cached",
+                })
 
     # ── LLM analysis ──────────────────────────────────────────────────────────
     llm = _get_llm()
