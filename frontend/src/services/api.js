@@ -33,6 +33,11 @@ const api = axios.create({
 });
 
 export const campaignApi = {
+    listCampaigns: async (limit = 5) => {
+        const response = await api.get(`/api/campaigns?limit=${limit}`);
+        return response.data;
+    },
+
     generateCampaign: async (brief) => {
         const response = await api.post('/api/campaigns/generate', { brief });
         return response.data;
@@ -55,6 +60,11 @@ export const campaignApi = {
 
     getMetrics: async (id) => {
         const response = await api.get(`/api/campaigns/${id}/metrics`);
+        return response.data;
+    },
+
+    getQuota: async () => {
+        const response = await api.get('/api/analytics/quota');
         return response.data;
     },
 

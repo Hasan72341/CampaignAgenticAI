@@ -2,19 +2,22 @@ import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-d
 import BriefPage from './pages/BriefPage';
 import ApprovalPage from './pages/ApprovalPage';
 import DashboardPage from './pages/DashboardPage';
+import SettingsPage from './pages/SettingsPage';
+import MainLayout from './components/MainLayout';
 
 function App() {
   return (
     <Router>
-      <div className="min-h-screen bg-gray-50 text-gray-900 font-sans">
+      <MainLayout>
         <Routes>
           <Route path="/" element={<BriefPage />} />
           <Route path="/approval/:id" element={<ApprovalPage />} />
           <Route path="/dashboard/:id" element={<DashboardPage />} />
           <Route path="/dashboard" element={<DashboardPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
-      </div>
+      </MainLayout>
     </Router>
   );
 }

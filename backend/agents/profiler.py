@@ -1,7 +1,7 @@
 """
 Agent 0: Customer Profiler
 
-Fetches the full 5000-customer cohort via the ToolFactory dynamic tool,
+Fetches the 1,000-customer cohort via the ToolFactory dynamic tool,
 enriches each record with LLM-assigned segment tags, and persists to
 the `customer_profiles` PostgreSQL table (upsert on customer_id).
 
@@ -108,7 +108,9 @@ def run_profiler(state: CampaignState, db: Session) -> CampaignState:
     customer_tags: dict[str, str] = llm_output.get("customer_tags", {})
     segment_taxonomy: dict = llm_output.get("segment_taxonomy", {})
 
-    # ── 3. Upsert all 5000 customers to PostgreSQL ────────────────────────────
+    # ── 3. Clear old profiles and Upsert new 1,000 customers ──────────────────
+    db.query(CustomerProfile).delete()
+    db.commit()
     _upsert_customers(db, customers, customer_tags)
 
     # ── 4. Log LLM reasoning to AgentLog ─────────────────────────────────────

@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from db.database import engine
-from api import campaigns, approval
+from api import campaigns, approval, analytics
 
 
 @asynccontextmanager
@@ -46,6 +46,7 @@ app.add_middleware(
 # ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(campaigns.router, prefix="/api", tags=["campaigns"])
 app.include_router(approval.router, prefix="/api", tags=["approval"])
+app.include_router(analytics.router, prefix="/api", tags=["analytics"])
 
 
 # ── Health check ─────────────────────────────────────────────────────────────

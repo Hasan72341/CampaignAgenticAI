@@ -24,29 +24,30 @@ IST_OFFSET = timezone(timedelta(hours=5, minutes=30))
 
 PLANNER_SYSTEM_PROMPT = """You are the Campaign Planner agent for a digital marketing AI system.
 
-You have access to enriched customer profiles with 17 demographic and behavioural fields.
+You have access to enriched customer profiles.
 Your task: parse the campaign brief and build an A/B test strategy with 2-3 distinct segments.
 
-Rules:
-- Read the segment taxonomy carefully to understand available audience clusters.
-- Each segment must have: a label, filter criteria, list of customer_ids, send_time, and variant_type.
+SCORING CRITICAL RULE:
+- You will define segments using "criteria" (key-value pairs matching customer fields).
+- DO NOT return "customer_ids" in your JSON. The system will assign IDs in Python based on your criteria.
+- Reach 100% of the cohort by defining broad or complementary segments.
+
+General Rules:
+- Read the segment taxonomy carefully.
+- Each segment must have: a label, criteria (dictionary of field:value filters), send_time, and variant_type.
 - send_time MUST be in format 'DD:MM:YY HH:MM:SS' (IST) and MUST be in the future.
-  Use the current IST time provided to you as reference.
-- Optimal send windows (IST): 08:00-09:00, 12:00-13:00, 18:00-20:00.
-- Use 2 segments minimum, 3 maximum. Each should cover a meaningfully different audience slice.
-- If the brief mentions inactive/low-engagement users, create a dedicated re-engagement segment.
+- Use 2 segments minimum, 3 maximum.
 - Assign "variant_type": "A", "B", or "C" to each segment.
-- Use the available fields (App_Installed, Existing Customer, KYC status, etc.) for targeting.
+- IMPORTANT: DO NOT use "Infinity" in JSON. If a range has no upper bound, use null or a very large number (999999999).
 
 Output JSON only:
 {
   "strategy_rationale": "...",
   "segments": [
     {
-      "label": "Segment A – High-Value Existing",
+      "label": "Segment A – High-Value",
       "variant_type": "A",
-      "criteria": {"existing_customer": "Y", "kyc_status": "Y"},
-      "customer_ids": ["CUST0001", "CUST0003", ...],
+      "criteria": {"existing_customer": "Y", "kyc_status": "Y", "monthly_income": [100000, null]},
       "send_time": "DD:MM:YY HH:MM:SS",
       "rationale": "..."
     }
@@ -61,7 +62,7 @@ def run_planner(state: CampaignState, db: Session) -> CampaignState:
 
     _update_campaign_status(db, campaign_id, CampaignStatus.planning)
 
-    # ── Load enriched profiles from DB (NOT external API) ─────────────────────
+    # ── Load enriched profiles from DB ────────────────────────────────────────
     profile_rows = db.query(CustomerProfile).all()
     profiles_summary = [
         {
@@ -79,7 +80,7 @@ def run_planner(state: CampaignState, db: Session) -> CampaignState:
             "segment_tag":       (r.segment_tags or {}).get("tag", "unclassified"),
         }
         for r in profile_rows
-    ]  
+    ]
 
     segment_taxonomy = state.get("segment_taxonomy", {})
     brief = state.get("brief", "")
@@ -103,9 +104,7 @@ def run_planner(state: CampaignState, db: Session) -> CampaignState:
             f"Segment taxonomy from Profiler:\n{json.dumps(segment_taxonomy, indent=2)}\n\n"
             f"Total customers: {len(profiles_summary)}\n"
             f"Sample profiles (first 5):\n{json.dumps(profiles_summary[:5], indent=2)}\n\n"
-            f"Note: You MUST return ONLY a raw JSON dictionary without any markdown wrappers or surrounding text. DO NOT rewrite the profiles. Return EXACTLY this structure:\n"
-            f'{{"strategy_rationale": "...", "segments": [{{...}}]}}'
-            f"Return ONLY valid JSON."
+            f"Return ONLY valid JSON dictionary following the schema."
         )),
     ]
 
@@ -115,29 +114,75 @@ def run_planner(state: CampaignState, db: Session) -> CampaignState:
     try:
         llm_output: dict = json.loads(raw_content)
     except json.JSONDecodeError:
-        logger.error("[Planner] LLM returned invalid JSON: %s", raw_content[:300])
-        raise ValueError("Planner LLM returned invalid JSON — check OLLAMA_BASE_URL/OLLAMA_MODEL and prompt")
+        logger.error("[Planner] Invalid JSON from LLM: %s", raw_content[:300])
+        raise ValueError("Planner LLM returned invalid JSON")
 
     planned_segments = llm_output.get("segments", [])
 
-    # ── Persist Segment rows to PostgreSQL ────────────────────────────────────
-    # Clear old segments from previous iterations
+    # ── 100% Coverage Logic (Python side) ─────────────────────────────────────
+    assigned_ids = set()
+    segment_dicts = []
+
+    # Prepare segments in DB
     old_segments = db.query(Segment).filter(Segment.campaign_id == campaign_id).all()
     for osg in old_segments:
         db.delete(osg)
     db.commit()
 
-    segment_dicts = []
-    for seg_data in planned_segments:
+    for idx, seg_data in enumerate(planned_segments):
+        criteria = seg_data.get("criteria", {})
+        
+        # Apply filters
+        seg_ids = []
+        for p in profiles_summary:
+            if p["customer_id"] in assigned_ids:
+                continue
+            
+            # Match all criteria (supporting ranges [min, max])
+            matches = True
+            for k, v in criteria.items():
+                p_val = p.get(k)
+                
+                # Support range [min, max]
+                if isinstance(v, list) and len(v) == 2:
+                    low, high = v
+                    # Handle None/Infinity in low
+                    if low is not None and p_val is not None and p_val < low:
+                        matches = False
+                        break
+                    # Handle None/Infinity in high
+                    if high is not None and p_val is not None and p_val > high:
+                        matches = False
+                        break
+                    if p_val is None: # if we have a range but no value, it can't match
+                        matches = False
+                        break
+                else:
+                    # Default equality
+                    if str(p_val).lower() != str(v).lower():
+                        matches = False
+                        break
+            
+            if matches:
+                seg_ids.append(p["customer_id"])
+                assigned_ids.add(p["customer_id"])
+
+        # If it's the LAST segment, grab any remaining customers to ensure 100% coverage
+        if idx == len(planned_segments) - 1:
+            for p in profiles_summary:
+                if p["customer_id"] not in assigned_ids:
+                    seg_ids.append(p["customer_id"])
+                    assigned_ids.add(p["customer_id"])
+
         seg = Segment(
             campaign_id=campaign_id,
             label=seg_data.get("label", "Unnamed"),
-            criteria=seg_data.get("criteria", {}),
-            customer_ids=seg_data.get("customer_ids", []),
+            criteria=_sanitize_criteria(criteria),
+            customer_ids=seg_ids,
             send_time=seg_data.get("send_time"),
         )
         db.add(seg)
-        db.flush()  # get seg.id
+        db.flush()
 
         segment_dicts.append({
             "id":           seg.id,
@@ -181,6 +226,24 @@ def run_planner(state: CampaignState, db: Session) -> CampaignState:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _sanitize_criteria(criteria: dict) -> dict:
+    """Recursively replace Infinity/-Infinity with None for JSON compliance."""
+    if not isinstance(criteria, dict):
+        return criteria
+    
+    clean = {}
+    for k, v in criteria.items():
+        if isinstance(v, float) and (v == float('inf') or v == float('-inf')):
+            clean[k] = None
+        elif isinstance(v, list):
+            clean[k] = [None if isinstance(x, float) and (x == float('inf') or x == float('-inf')) else x for x in v]
+        elif isinstance(v, dict):
+            clean[k] = _sanitize_criteria(v)
+        else:
+            clean[k] = v
+    return clean
+
 
 def _update_campaign_status(db: Session, campaign_id: str, status: CampaignStatus):
     db.query(Campaign).filter(Campaign.id == campaign_id).update(

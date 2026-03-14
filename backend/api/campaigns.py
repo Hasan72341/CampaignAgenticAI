@@ -71,6 +71,8 @@ def _serialize_campaign(campaign: Campaign):
                 "agent_name": log.agent_name,
                 "step": log.step,
                 "llm_reasoning": log.llm_reasoning,
+                "input_payload": log.input_payload,
+                "output_payload": log.output_payload,
                 "created_at": log.created_at
             }
             for log in campaign.agent_logs
@@ -115,6 +117,13 @@ def generate_campaign(
     background_tasks.add_task(_run_campaign_workflow, campaign.id, req.brief)
 
     return GenerateCampaignResponse(campaign_id=campaign.id, status=campaign.status.value)
+
+
+@router.get("/campaigns")
+def list_campaigns(limit: int = 5, db: Session = Depends(get_db)):
+    """Return the most recent campaigns for the sidebar list."""
+    campaigns = db.query(Campaign).order_by(Campaign.created_at.desc()).limit(limit).all()
+    return [_serialize_campaign(c) for c in campaigns]
 
 
 @router.get("/campaigns/{campaign_id}/status")

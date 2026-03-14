@@ -1,34 +1,68 @@
 import React, { useState, useEffect } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { campaignApi } from '../services/api';
-import TimelineNode from '../components/TimelineNode';
 import MetricsChart from '../components/MetricsChart';
-import VariantCard from '../components/VariantCard';
-import { Loader2, RefreshCw, Activity, ArrowRight, Server, Database, ActivitySquare, AlertTriangle } from 'lucide-react';
+import {
+    Loader2,
+    RefreshCw,
+    Activity,
+    Database,
+    ActivitySquare,
+    Terminal,
+    Zap,
+    TrendingUp,
+    Target,
+    ArrowUpRight,
+    ChevronDown,
+    Cpu
+} from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
 import clsx from 'clsx';
+
+const KPICard = ({ icon: Icon, label, value, trend, colorClass }) => (
+    <div className={clsx("glass-card p-6 border-slate-200 flex flex-col gap-4", colorClass)}>
+        <div className="flex justify-between items-start">
+            <div className="p-3 bg-white/80 rounded-xl shadow-sm">
+                <Icon className="w-5 h-5 text-slate-900" />
+            </div>
+            {trend && (
+                <div className="flex items-center gap-1 text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-lg text-[10px] font-black uppercase tracking-widest">
+                    <ArrowUpRight className="w-3 h-3" />
+                    {trend}
+                </div>
+            )}
+        </div>
+        <div className="space-y-1">
+            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{label}</span>
+            <div className="text-3xl font-black text-slate-900 tabular-nums">{value}</div>
+        </div>
+    </div>
+);
 
 export default function DashboardPage() {
     const { id } = useParams();
     const [data, setData] = useState(null);
     const [metrics, setMetrics] = useState(null);
-    const [sysStatus, setSysStatus] = useState(null);
     const [loading, setLoading] = useState(true);
     const [optimizeLoading, setOptimizeLoading] = useState(false);
     const [selectedNode, setSelectedNode] = useState(null);
 
     const loadData = async () => {
-        if (!id) return;
+        if (!id) {
+            setLoading(false);
+            return;
+        }
         try {
-            const [campData, metsData, sysData] = await Promise.all([
+            const [campData, metsResponse] = await Promise.all([
                 campaignApi.getCampaignStatus(id),
-                campaignApi.getMetrics(id).catch(() => ({})),
-                campaignApi.getSystemStatus().catch(() => ({}))
+                campaignApi.getMetrics(id).catch(() => ({ metrics: [] }))
             ]);
-            setData(campData);
-            setMetrics(metsData);
-            setSysStatus(sysData);
 
-            if (!selectedNode && campData.agent_logs && campData.agent_logs.length > 0) {
+            const metricsArray = metsResponse.metrics || [];
+            setData(campData);
+            setMetrics(metricsArray);
+
+            if (!selectedNode && campData.agent_logs?.length > 0) {
                 setSelectedNode(campData.agent_logs[campData.agent_logs.length - 1]);
             }
         } catch (error) {
@@ -40,254 +74,181 @@ export default function DashboardPage() {
 
     useEffect(() => {
         loadData();
-        // Poll every 5s if we are in monitoring/optimizing state
-        let interval;
-        if (data?.status === 'monitoring' || data?.status === 'optimizing' || data?.status === 'executing') {
-            interval = setInterval(loadData, 5000);
-        }
+        const interval = setInterval(loadData, 8000);
         return () => clearInterval(interval);
-    }, [id, data?.status]);
+    }, [id]);
 
-    const handleOptimize = async () => {
-        setOptimizeLoading(true);
-        try {
-            await campaignApi.triggerOptimize(id);
-            await loadData();
-        } catch (error) {
-            console.error("Optimize failed", error);
-            alert("Failed to start optimization loop");
-        } finally {
-            setOptimizeLoading(false);
-        }
-    };
-
-    if (loading && !data) {
+    if (!id) {
         return (
-            <div className="flex items-center justify-center min-h-screen bg-gray-50">
-                <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
+            <div className="flex flex-col items-center justify-center min-h-[60vh] gap-6 text-center">
+                <div className="w-20 h-20 bg-slate-100 rounded-3xl flex items-center justify-center text-slate-300">
+                    <Database className="w-10 h-10" />
+                </div>
+                <div className="space-y-2">
+                    <h2 className="text-2xl font-black text-slate-900">No Campaign Selected</h2>
+                    <p className="text-slate-500 max-w-sm mx-auto">Select a campaign from the sidebar or start a new one to view real-time performance telemetry.</p>
+                </div>
+                <Link to="/" className="px-6 py-3 bg-indigo-600 text-white font-bold rounded-xl shadow-lg shadow-indigo-100 transition-all hover:scale-105">
+                    Start New Campaign
+                </Link>
             </div>
         );
     }
 
-    if (!data) return <div className="p-8 text-center text-red-500">Campaign not found.</div>;
-
-    const currentCampStatus = data.status;
-    const isExecuting = currentCampStatus === 'executing';
-    const isOptimizing = currentCampStatus === 'optimizing';
-    const isCompleted = currentCampStatus === 'completed';
-
-    // Build Timeline Nodes (derived from agent_logs)
-    // We want to group by agent_name roughly, but sequential logs work too.
-    const timelineNodes = (data.agent_logs || []).map((log, i) => {
-        let status = 'success';
-        let label = log.agent_name;
-        // simple heuristic to format
-        if (label.includes('Planner')) label = 'Planner';
-        if (label.includes('Generator')) label = 'Generator';
-        if (label.includes('Profiler')) label = 'Profiler';
-        if (label.includes('Analyst')) label = 'Analyst';
-        if (label.includes('Optimizer')) label = 'Optimizer';
-
-        return {
-            id: log.id,
-            label: `${label} (v${log.step || 1})`,
-            status: status,
-            raw: log
-        };
-    });
-
-    // Add trailing active nodes based on status
-    if (currentCampStatus === 'planning') timelineNodes.push({ id: 'active-node', label: 'Planner', status: 'active' });
-    if (currentCampStatus === 'generating') timelineNodes.push({ id: 'active-node', label: 'Generator', status: 'active' });
-    if (isExecuting) timelineNodes.push({ id: 'exec-node', label: 'Execution Engine', status: 'active' });
-    if (currentCampStatus === 'monitoring') timelineNodes.push({ id: 'mon-node', label: 'Analyst', status: 'active' });
-
-    // Prepare metrics for Chart
-    let chartData = [];
-    let totalOpenRate = 0;
-    let totalClickRate = 0;
-    let overAllWeighted = 0;
-
-    if (metrics?.variants && metrics.variants.length > 0) {
-        chartData = metrics.variants.map((v, i) => {
-            const sent = v.sent_count || 0;
-            const open = v.open_count || 0;
-            const click = v.click_count || 0;
-            const oRate = sent > 0 ? (open / sent) * 100 : 0;
-            const cRate = sent > 0 ? (click / sent) * 100 : 0;
-            const wScore = (cRate * 0.7) + (oRate * 0.3);
-            return {
-                name: `Var ${i + 1} (${v.subject ? v.subject.substring(0, 10) + '...' : 'No Subj'})`,
-                openRate: parseFloat(oRate.toFixed(1)),
-                clickRate: parseFloat(cRate.toFixed(1)),
-                weighted: parseFloat(wScore.toFixed(1))
-            }
-        });
-        totalOpenRate = metrics.overall_open_rate ? (metrics.overall_open_rate * 100).toFixed(1) : 0;
-        totalClickRate = metrics.overall_click_rate ? (metrics.overall_click_rate * 100).toFixed(1) : 0;
-        overAllWeighted = metrics.overall_weighted_score ? (metrics.overall_weighted_score * 100).toFixed(1) : 0;
+    if (loading && !data) {
+        return (
+            <div className="flex flex-col items-center justify-center min-h-[60vh] gap-4">
+                <Loader2 className="w-12 h-12 animate-spin text-indigo-600" />
+                <p className="text-slate-400 font-bold uppercase tracking-[0.2em] text-xs">Streaming Real-time Analytics</p>
+            </div>
+        );
     }
 
+    const chartData = (metrics || []).map((v, i) => ({
+        name: v.segment_label || `V${i + 1}`,
+        openRate: v.open_rate || 0,
+        clickRate: v.click_rate || 0,
+        weighted: v.weighted_score || 0
+    }));
+
+    const totalSent = (metrics || []).reduce((acc, v) => acc + (v.total_sent || 0), 0);
+    const avgOpen = metrics?.length ? (metrics.reduce((acc, v) => acc + (v.open_rate || 0), 0) / metrics.length).toFixed(1) : "0.0";
+    const avgClick = metrics?.length ? (metrics.reduce((acc, v) => acc + (v.click_rate || 0), 0) / metrics.length).toFixed(1) : "0.0";
+
+    const stats = [
+        { id: 'reach', label: 'Mandate Coverage', value: totalSent, icon: Target, trend: 'Cohort Alpha' },
+        { id: 'open', label: 'Aggregate Open Rate', value: `${avgOpen}%`, icon: TrendingUp },
+        { id: 'click', label: 'Aggregate Click Rate', value: `${avgClick}%`, icon: Activity },
+    ];
+
     return (
-        <div className="min-h-screen bg-gray-50 pb-20">
-            {/* Top Nav */}
-            <header className="bg-white border-b sticky top-0 z-30 shadow-sm">
-                <div className="max-w-[90rem] mx-auto px-4 sm:px-6 py-4 flex items-center justify-between">
-                    <div className="flex items-center space-x-6">
-                        <h1 className="text-xl font-bold text-gray-900 tracking-tight flex items-center gap-2">
-                            <ActivitySquare className="w-5 h-5 text-blue-600" /> Glass-Box Dashboard
-                        </h1>
-                        <div className="h-6 w-px bg-gray-300" />
-                        <div className="text-sm font-medium text-gray-500">ID: <span className="text-gray-900 font-mono text-xs bg-gray-100 px-2 py-1 rounded">{id.substring(0, 8)}</span></div>
-                        <div className="px-3 py-1 bg-green-50 text-green-700 text-xs font-bold rounded-full border border-green-200 uppercase tracking-wide">
-                            {currentCampStatus.replace('_', ' ')}
-                        </div>
+        <div className="p-8 h-screen flex flex-col gap-8 overflow-hidden">
+            {/* Control Bar */}
+            <header className="flex justify-between items-center shrink-0">
+                <div className="space-y-1">
+                    <div className="flex items-center gap-2 text-emerald-600">
+                        <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse" />
+                        <span className="text-[10px] font-black uppercase tracking-[0.2em]">Real-time Telemetry Active</span>
                     </div>
-                    <div className="flex items-center space-x-4">
-                        {/* Rate Limit Indicator */}
-                        {sysStatus?.rate_limits && (
-                            <div className="hidden md:flex items-center space-x-3 text-xs">
-                                <div className="flex items-center gap-1 text-gray-500 font-medium bg-gray-100 px-2 py-1 rounded border">
-                                    <Database className="w-3 h-3" /> Cohort: {sysStatus.rate_limits.get_customer_cohort || 0}/100
-                                </div>
-                                <div className="flex items-center gap-1 text-gray-500 font-medium bg-gray-100 px-2 py-1 rounded border">
-                                    <Server className="w-3 h-3" /> Send: {sysStatus.rate_limits.send_campaign || 0}/100
-                                </div>
-                            </div>
-                        )}
-                        <button onClick={loadData} className="p-2 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Refresh">
-                            <RefreshCw className="w-5 h-5" />
-                        </button>
-                        <Link to="/" className="text-sm font-semibold text-blue-600 hover:underline">New Campaign</Link>
+                    <h1 className="text-3xl font-black text-slate-900 tracking-tight flex items-center gap-3">
+                        Strategic <span className="gradient-text">Intelligence</span>
+                        <ChevronDown className="w-6 h-6 text-slate-300" />
+                    </h1>
+                </div>
+
+                <div className="flex gap-4">
+                    <div className="bg-white border border-slate-200 px-4 py-2 rounded-xl flex items-center gap-3">
+                        <Database className="w-4 h-4 text-slate-400" />
+                        <span className="text-xs font-bold text-slate-600">TX-ID: {id?.substring(0, 8)}</span>
                     </div>
+                    <button
+                        onClick={loadData}
+                        className="p-3 bg-white border border-slate-200 rounded-xl hover:bg-slate-50 transition-colors"
+                    >
+                        <RefreshCw className="w-4 h-4 text-slate-600" />
+                    </button>
                 </div>
             </header>
 
-            <main className="max-w-[90rem] mx-auto px-4 sm:px-6 py-8 grid grid-cols-1 lg:grid-cols-12 gap-8">
+            {/* Main Grid */}
+            <div className="flex-1 grid grid-cols-12 gap-8 min-h-0">
 
-                {/* Left Column: Flow & Metrics */}
-                <div className="lg:col-span-8 flex flex-col space-y-8">
+                {/* Left Side: Stats & Metrics */}
+                <div className="col-span-12 lg:col-span-8 flex flex-col gap-8 min-h-0">
 
-                    {/* Agent Flow Timeline */}
-                    <section className="bg-white rounded-xl shadow-sm border p-6">
-                        <h2 className="text-lg font-bold text-gray-900 mb-6 flex items-center gap-2">
-                            <Activity className="w-5 h-5 text-indigo-500" /> LangGraph Execution Flow
-                        </h2>
-                        <div className="relative flex justify-between items-start pt-4 overflow-x-auto pb-4 px-2">
-                            {/* Timeline connecting line */}
-                            <div className="absolute top-[26px] left-10 right-10 h-0.5 bg-gray-200 -z-0" />
+                    {/* KPI Ribbon */}
+                    <div className="grid grid-cols-3 gap-6 shrink-0">
+                        {stats.map(s => <KPICard key={s.id} {...s} />)}
+                    </div>
 
-                            {timelineNodes.length === 0 ? (
-                                <div className="text-center w-full text-sm text-gray-400">Timeline starting...</div>
-                            ) : (
-                                timelineNodes.map((node, i) => (
-                                    <React.Fragment key={i}>
-                                        <TimelineNode
-                                            node={node}
-                                            isActive={selectedNode?.id === node.id}
-                                            onClick={(n) => n.raw ? setSelectedNode(n.raw) : null}
-                                        />
-                                    </React.Fragment>
-                                ))
-                            )}
-                        </div>
-                    </section>
-
-                    {/* Performance Metrics Section */}
-                    <section className="bg-white rounded-xl shadow-sm border p-6 flex flex-col space-y-6">
-                        <div className="flex justify-between items-center">
-                            <h2 className="text-lg font-bold text-gray-900">Campaign Performance</h2>
-                            <button
-                                onClick={handleOptimize}
-                                disabled={isOptimizing || isExecuting || !isCompleted}
-                                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-lg shadow-sm transition-colors text-sm flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
-                            >
-                                {optimizeLoading || isOptimizing ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-                                <span>{isOptimizing ? 'Optimizing Loop...' : 'Optimize Next Campaign'}</span>
-                            </button>
-                        </div>
-
-                        {/* KPI Cards */}
-                        <div className="grid grid-cols-3 gap-4">
-                            <div className="bg-blue-50 border border-blue-100 rounded-lg p-4">
-                                <div className="text-xs font-semibold text-blue-700 uppercase tracking-widest mb-1">Open Rate</div>
-                                <div className="text-3xl font-bold text-gray-900">{totalOpenRate}%</div>
-                            </div>
-                            <div className="bg-indigo-50 border border-indigo-100 rounded-lg p-4">
-                                <div className="text-xs font-semibold text-indigo-700 uppercase tracking-widest mb-1">Click Rate</div>
-                                <div className="text-3xl font-bold text-gray-900">{totalClickRate}%</div>
-                            </div>
-                            <div className="bg-green-50 border border-green-100 rounded-lg p-4">
-                                <div className="text-xs font-semibold text-green-700 uppercase tracking-widest mb-1">Weighted Score</div>
-                                <div className="text-3xl font-bold text-green-900">{overAllWeighted}%</div>
+                    {/* Chart Center */}
+                    <div className="glass-card flex-1 bg-white border-slate-200 p-8 flex flex-col min-h-0">
+                        <div className="flex justify-between items-center mb-10">
+                            <h3 className="text-lg font-bold text-slate-900 flex items-center gap-2">
+                                <ActivitySquare className="w-5 h-5 text-indigo-500" /> Conversion Funnel
+                            </h3>
+                            <div className="flex items-center gap-6">
+                                <div className="flex items-center gap-2">
+                                    <div className="w-3 h-3 bg-indigo-500 rounded-full shadow-[0_0_10px_rgba(99,102,241,0.5)]" />
+                                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Open Rate</span>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <div className="w-3 h-3 bg-emerald-500 rounded-full shadow-[0_0_10px_rgba(16,185,129,0.5)]" />
+                                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Click Rate</span>
+                                </div>
                             </div>
                         </div>
-
-                        {/* Recharts Bar/Line Chart */}
-                        <MetricsChart data={chartData} />
-
-                        {/* Iteration Notice */}
-                        {(metrics?.iteration_count && metrics.iteration_count > 1) ? (
-                            <div className="text-xs text-gray-500 flex justify-between bg-gray-50 p-2 rounded">
-                                <span>Iteration: {metrics.iteration_count}</span>
-                                <span>Models are adjusting based on previous failures.</span>
-                            </div>
-                        ) : null}
-                    </section>
+                        <div className="flex-1 min-h-0">
+                            <MetricsChart data={chartData} transparent />
+                        </div>
+                    </div>
                 </div>
 
-                {/* Right Column: Reasoning Inspector */}
-                <div className="lg:col-span-4 flex flex-col h-[calc(100vh-8rem)]">
-                    <section className="bg-gray-900 rounded-xl shadow-lg border border-gray-800 flex flex-col h-full overflow-hidden">
-                        <div className="p-4 bg-gray-950 border-b border-gray-800 flex justify-between items-center shrink-0">
-                            <h3 className="font-semibold text-white tracking-wide text-sm flex items-center gap-2">
-                                <AlertTriangle className="w-4 h-4 text-yellow-500" />
-                                Agent Reasoning Log
-                            </h3>
-                            {selectedNode && (
-                                <span className="text-xs text-gray-400 bg-gray-800 px-2 py-0.5 rounded font-mono">
-                                    {selectedNode.agent_name}
-                                </span>
-                            )}
+                {/* Right Side: Reasoning Console */}
+                <div className="col-span-12 lg:col-span-4 flex flex-col min-h-0">
+                    <div className="bg-slate-950 rounded-[2rem] border border-slate-800 shadow-2xl flex flex-col h-full overflow-hidden">
+                        <div className="p-6 border-b border-slate-800 flex items-center justify-between shrink-0">
+                            <div className="flex items-center gap-3 text-white">
+                                <Terminal className="w-5 h-5 text-indigo-400" />
+                                <h3 className="font-bold text-sm tracking-wide">Orchestration Trace</h3>
+                            </div>
+                            <div className="flex items-center gap-2 px-2 py-1 bg-indigo-500/10 border border-indigo-500/20 rounded-lg">
+                                <Cpu className="w-3 h-3 text-indigo-400" />
+                                <span className="text-[10px] font-black text-indigo-400 uppercase tracking-widest">{selectedNode?.agent_name || 'System'}</span>
+                            </div>
                         </div>
 
-                        <div className="p-4 flex-grow overflow-y-auto space-y-6 scrollbar-thin scrollbar-thumb-gray-700 scrollbar-track-transparent">
+                        <div className="flex-1 overflow-y-auto p-6 custom-scrollbar space-y-8 font-mono">
                             {selectedNode ? (
-                                <>
-                                    <div className="space-y-2">
-                                        <div className="text-xs font-bold text-gray-400 uppercase tracking-wider">Input Strategy</div>
-                                        <pre className="text-[10px] text-green-400 font-mono bg-black/50 p-3 rounded overflow-x-auto border border-gray-800">
-                                            {JSON.stringify(selectedNode.input_payload, null, 2) || "// No Input"}
-                                        </pre>
+                                <motion.div
+                                    initial={{ opacity: 0 }}
+                                    animate={{ opacity: 1 }}
+                                    className="space-y-10"
+                                >
+                                    <div>
+                                        <span className="text-[10px] font-black text-indigo-500/80 uppercase tracking-[0.2em] block mb-4 underline underline-offset-4 decoration-indigo-500/30">Trace Reasoning</span>
+                                        <p className="text-xs text-slate-400 leading-relaxed italic border-l-2 border-indigo-500/30 pl-4">
+                                            {selectedNode.llm_reasoning || "// No cognitive trace found for this vector."}
+                                        </p>
                                     </div>
 
-                                    <div className="space-y-2">
-                                        <div className="text-xs font-bold text-gray-400 uppercase tracking-wider">LLM Chain of Thought</div>
-                                        <div className="text-xs text-gray-300 whitespace-pre-wrap leading-relaxed bg-black/30 p-3 rounded-lg border-l-2 border-indigo-500 font-serif italic">
-                                            {selectedNode.llm_reasoning || "Reasoning trace not captured."}
-                                        </div>
-                                    </div>
-
-                                    <div className="space-y-2">
-                                        <div className="text-xs font-bold text-gray-400 uppercase tracking-wider flex items-center justify-between">
-                                            <span>Synthesized Output</span>
-                                            <ArrowRight className="w-3 h-3" />
-                                        </div>
-                                        <pre className="text-[10px] text-blue-400 font-mono bg-black/50 p-3 rounded overflow-x-auto border border-gray-800">
-                                            {JSON.stringify(selectedNode.output_payload, null, 2) || "// No Output"}
+                                    <div>
+                                        <span className="text-[10px] font-black text-emerald-500/80 uppercase tracking-[0.2em] block mb-4 underline underline-offset-4 decoration-emerald-500/30">State Modification</span>
+                                        <pre className="text-[10px] text-slate-300 leading-tight bg-slate-900/50 p-4 rounded-xl border border-slate-800 overflow-x-auto">
+                                            {JSON.stringify(selectedNode.output_payload, null, 2)}
                                         </pre>
                                     </div>
-                                </>
+                                </motion.div>
                             ) : (
-                                <div className="flex flex-col items-center justify-center h-full text-gray-600 text-sm space-y-3">
-                                    <ActivitySquare className="w-12 h-12 opacity-20" />
-                                    <p>Click an active Agent Node in the timeline to inspect IO.</p>
+                                <div className="flex flex-col items-center justify-center h-full gap-4 text-slate-600 text-center opacity-40">
+                                    <Zap className="w-12 h-12" />
+                                    <p className="text-sm font-bold uppercase tracking-widest">Awaiting Agent IO</p>
                                 </div>
                             )}
                         </div>
-                    </section>
+
+                        {/* Node Selector (Mini Timeline) */}
+                        <div className="p-4 bg-slate-900/50 border-t border-slate-800 flex gap-2 overflow-x-auto shrink-0 no-scrollbar">
+                            {data?.agent_logs?.map((log, i) => (
+                                <button
+                                    key={log.id}
+                                    onClick={() => setSelectedNode(log)}
+                                    className={clsx(
+                                        "shrink-0 px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all",
+                                        selectedNode?.id === log.id ? "bg-indigo-600 text-white shadow-lg shadow-indigo-900/50" : "bg-slate-800 text-slate-500 hover:text-slate-300"
+                                    )}
+                                >
+                                    {log.agent_name === "CustomerProfiler" ? "Insight" :
+                                        log.agent_name === "CampaignPlanner" ? "Strategy" :
+                                            log.agent_name === "ContentGenerator" ? "Creative" :
+                                                log.agent_name === "PerformanceAnalyst" ? "Analytics" :
+                                                    log.agent_name === "StrategyOptimizer" ? "Growth" : "Phase " + (i + 1)}
+                                </button>
+                            ))}
+                        </div>
+                    </div>
                 </div>
-            </main>
+            </div>
         </div>
     );
 }
