@@ -25,3 +25,5 @@ raw.md
 report.pdf
 structure.yaml
 apidoc
+# Local Netlify folder
+.netlify
